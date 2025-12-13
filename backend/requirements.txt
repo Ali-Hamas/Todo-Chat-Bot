@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+sqlmodel
+psycopg2-binary
+openai
+mcp
+python-multipart
+python-jose[cryptography]
+passlib[argon2]
+argon2-cffi
+alembic
