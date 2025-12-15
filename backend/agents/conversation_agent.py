@@ -1,22 +1,138 @@
+"""
+Conversation Agent
+
+An AI agent that manages conversations and todo tasks using the TodoManagementSkill.
+This agent uses OpenAI's function calling to determine when to execute
+task management operations.
+"""
+
 from openai import OpenAI
 from typing import Dict, List, Any
 import json
-from database.deps import get_db_session
-from models.todo_models import Conversation, Message, MessageRole, TaskStatus
-from services.task_service import create_task, get_tasks, update_task, complete_task, delete_task
+from backend.database.deps import get_db_session
+from backend.models.todo_models import Conversation, Message, MessageRole
+from backend.app.skills.todo_skill import TodoManagementSkill
 from datetime import datetime
 from sqlmodel import Session, select
 
+
+# Tool definitions for the OpenAI function calling API
+TODO_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "add_task",
+            "description": "Add a new task to the todo list",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "The title of the task"},
+                    "description": {"type": "string", "description": "Optional description of the task"}
+                },
+                "required": ["title"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "List all tasks or filter by status (all, pending, completed)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["all", "pending", "completed"],
+                        "description": "Filter tasks by status"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Mark a task as completed",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer", "description": "The ID of the task to complete"}
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_task",
+            "description": "Delete a task from the todo list",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer", "description": "The ID of the task to delete"}
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task",
+            "description": "Update a task's details (title, description, or status)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer", "description": "The ID of the task to update"},
+                    "title": {"type": "string", "description": "The new title for the task"},
+                    "description": {"type": "string", "description": "The new description for the task"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "completed"],
+                        "description": "The new status for the task"
+                    }
+                },
+                "required": ["task_id"]
+            }
+        }
+    }
+]
+
+
 class ConversationAgent:
-    def __init__(self):
-        # Initialize OpenAI client (using a mock for now, replace with actual API key handling)
-        # In a real implementation, you would set the API key properly
-        self.client = OpenAI(api_key="sk-...")  # This would be set from environment
-        self.model = "gpt-4-turbo"  # or another appropriate model
+    """
+    AI Agent for managing conversations with todo task capabilities.
+
+    This agent uses OpenAI's function calling capability to interpret user
+    requests and execute appropriate task management operations via the
+    TodoManagementSkill.
+    """
+
+    def __init__(self, user_id: int = 1):
+        """
+        Initialize the ConversationAgent.
+
+        Args:
+            user_id: The ID of the user this agent is serving
+        """
+        self.client = OpenAI()
+        self.model = "gpt-4-turbo"
+        self.user_id = user_id
 
     def run_agent(self, user_input: str, conversation_id: int) -> Dict[str, Any]:
         """
-        Run the agent with the user input and return the response
+        Run the agent with the user input and return the response.
+
+        Args:
+            user_input: The user's message
+            conversation_id: The ID of the conversation
+
+        Returns:
+            Dict containing response and conversation_id
         """
         # Load conversation history
         messages = self.load_conversation_history(conversation_id)
@@ -27,88 +143,12 @@ class ConversationAgent:
             "content": user_input
         })
 
-        # Define the tools that the agent can use
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "add_task",
-                    "description": "Add a new task to the todo list",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string", "description": "The title of the task"},
-                            "description": {"type": "string", "description": "The description of the task"}
-                        },
-                        "required": ["title"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_tasks",
-                    "description": "List all tasks or filter by status",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "status": {"type": "string", "enum": ["all", "pending", "completed"], "description": "Filter tasks by status"}
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "complete_task",
-                    "description": "Mark a task as completed",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "task_id": {"type": "integer", "description": "The ID of the task to complete"}
-                        },
-                        "required": ["task_id"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "delete_task",
-                    "description": "Delete a task from the todo list",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "task_id": {"type": "integer", "description": "The ID of the task to delete"}
-                        },
-                        "required": ["task_id"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "update_task",
-                    "description": "Update a task's details",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "task_id": {"type": "integer", "description": "The ID of the task to update"},
-                            "title": {"type": "string", "description": "The new title for the task"}
-                        },
-                        "required": ["task_id"]
-                    }
-                }
-            }
-        ]
-
         # Call the OpenAI API with tools
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=tools,
+                tools=TODO_TOOLS,
                 tool_choice="auto"
             )
 
@@ -122,7 +162,7 @@ class ConversationAgent:
                     function_name = tool_call.function.name
                     function_args = json.loads(tool_call.function.arguments)
 
-                    # Execute the actual tool function
+                    # Execute the tool using TodoManagementSkill
                     result = self.execute_tool(function_name, function_args)
                     tool_results.append({
                         "tool_call_id": tool_call.id,
@@ -161,105 +201,73 @@ class ConversationAgent:
 
     def execute_tool(self, function_name: str, function_args: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Execute the tool function with the provided arguments
+        Execute a tool function using the TodoManagementSkill.
+
+        Args:
+            function_name: The name of the function to execute
+            function_args: The arguments for the function
+
+        Returns:
+            Dict containing the result of the tool execution
         """
         with get_db_session() as session:
+            # Create skill instance with session and user context
+            skill = TodoManagementSkill(session=session, user_id=self.user_id)
+
             try:
                 if function_name == "add_task":
-                    title = function_args.get("title")
-                    description = function_args.get("description", "")
-                    task = create_task(session, title, description)
-                    return {
-                        "success": True,
-                        "task_id": task.id,
-                        "title": task.title,
-                        "description": task.description,
-                        "status": task.status.value
-                    }
+                    return skill.add_task(
+                        title=function_args.get("title"),
+                        description=function_args.get("description", "")
+                    )
                 elif function_name == "list_tasks":
-                    status = function_args.get("status", "all")
-                    from backend.models.todo_models import TaskStatus
-                    status_filter = None
-                    if status != "all":
-                        try:
-                            status_filter = TaskStatus(status)
-                        except ValueError:
-                            return {"error": f"Invalid status: {status}. Use 'all', 'pending', or 'completed'"}
-
-                    tasks = get_tasks(session, user_id=1, status=status_filter)  # Using default user_id for now
-                    task_list = []
-                    for task in tasks:
-                        task_list.append({
-                            "id": task.id,
-                            "title": task.title,
-                            "description": task.description,
-                            "status": task.status.value,
-                            "created_at": task.created_at.isoformat()
-                        })
-
-                    return {
-                        "tasks": task_list,
-                        "total": len(task_list)
-                    }
+                    return skill.list_tasks(
+                        status=function_args.get("status", "all")
+                    )
                 elif function_name == "complete_task":
-                    task_id = function_args.get("task_id")
-                    task = complete_task(session, task_id)
-                    if task:
-                        return {
-                            "success": True,
-                            "task_id": task.id,
-                            "status": task.status.value
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "error": f"Task with ID {task_id} not found"
-                        }
+                    return skill.complete_task(
+                        task_id=function_args.get("task_id")
+                    )
                 elif function_name == "delete_task":
-                    task_id = function_args.get("task_id")
-                    success = delete_task(session, task_id)
-                    if success:
-                        return {
-                            "success": True,
-                            "task_id": task_id
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "error": f"Task with ID {task_id} not found"
-                        }
+                    return skill.delete_task(
+                        task_id=function_args.get("task_id")
+                    )
                 elif function_name == "update_task":
-                    task_id = function_args.get("task_id")
-                    title = function_args.get("title")
-                    updated_task = update_task(session, task_id, title=title)
-                    if updated_task:
-                        return {
-                            "success": True,
-                            "task_id": updated_task.id,
-                            "title": updated_task.title,
-                            "description": updated_task.description,
-                            "status": updated_task.status.value
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "error": f"Task with ID {task_id} not found"
-                        }
+                    return skill.update_task(
+                        task_id=function_args.get("task_id"),
+                        title=function_args.get("title"),
+                        description=function_args.get("description"),
+                        status=function_args.get("status")
+                    )
                 else:
-                    return {"error": f"Unknown function: {function_name}"}
+                    return {
+                        "success": False,
+                        "error": f"Unknown function: {function_name}",
+                        "message": f"The function '{function_name}' is not supported."
+                    }
             except Exception as e:
-                return {"error": f"Error executing tool {function_name}: {str(e)}"}
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "message": f"Error executing {function_name}: {str(e)}"
+                }
 
     def load_conversation_history(self, conversation_id: int) -> List[Dict[str, str]]:
         """
-        Load conversation history from the database
+        Load conversation history from the database.
+
+        Args:
+            conversation_id: The ID of the conversation
+
+        Returns:
+            List of message dicts formatted for OpenAI API
         """
         with get_db_session() as session:
-            # Query messages for the conversation
-            statement = select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+            statement = select(Message).where(
+                Message.conversation_id == conversation_id
+            ).order_by(Message.created_at)
             messages = session.exec(statement).all()
 
-            # Format messages for OpenAI API
             formatted_messages = []
             for msg in messages:
                 role = "assistant" if msg.role == MessageRole.assistant else "user"
@@ -272,10 +280,14 @@ class ConversationAgent:
 
     def save_message(self, conversation_id: int, role: str, content: str):
         """
-        Save a message to the conversation in the database
+        Save a message to the conversation in the database.
+
+        Args:
+            conversation_id: The ID of the conversation
+            role: The role of the message sender ('user' or 'assistant')
+            content: The message content
         """
         with get_db_session() as session:
-            # Create a new message
             message_role = MessageRole.assistant if role == "assistant" else MessageRole.user
             message = Message(
                 conversation_id=conversation_id,

@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Form, Body
 from sqlmodel import Session, select
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import os
+import asyncio
 
 from db import get_session, engine
-from models import Task, TaskCreate, TaskUpdate, TaskRead, User, Conversation, Message, MessageRole
+from models.todo_models import Task, TaskCreate, TaskUpdate, TaskRead, User, Conversation, Message, MessageRole
 from tasks_crud import get_user_tasks, get_task_by_id, create_task_for_user, update_task, delete_task
 from auth import get_current_user
 from sqlmodel import SQLModel
@@ -121,6 +122,18 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class ChatRequest(BaseModel):
+    """Request model for the chat endpoint per spec."""
+    message: str
+    conversation_id: Optional[int] = None
+
+
+class ChatResponse(BaseModel):
+    """Response model for the chat endpoint."""
+    response: str
+    conversation_id: int
 
 @app.post("/auth/register", response_model=dict)
 def register_user(
@@ -248,27 +261,46 @@ def health_check():
     return {"status": "healthy", "message": "Todo API is running!"}
 
 
-@app.post("/api/chat")
-def chat_with_assistant(
-    message: Dict[str, Any],
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_with_assistant(
+    chat_request: ChatRequest,
     current_user_id: str = Depends(get_current_user),
     db: Session = Depends(get_session)
 ):
-    """Chat with the AI assistant to manage tasks."""
-    user_message = message.get("message", "")
-    conversation_id = message.get("conversation_id")
+    """
+    Stateless chat endpoint that processes messages via OpenAI Agent.
+
+    Per spec: Receives a message, processes it via OpenAI Agent,
+    executes MCP tools, saves state to DB, and returns response.
+
+    The endpoint is stateless - all conversation history is persisted
+    to Neon DB and loaded fresh for each request.
+    """
+    user_message = chat_request.message
+    conversation_id = chat_request.conversation_id
+
+    # Validate user_id
+    try:
+        user_id_int = int(current_user_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid user ID"
+        )
 
     # If no conversation_id is provided, create a new conversation
     if not conversation_id:
-        conversation = Conversation(user_id=current_user_id)
+        conversation = Conversation(user_id=user_id_int)
         db.add(conversation)
         db.commit()
         db.refresh(conversation)
         conversation_id = conversation.id
     else:
-        # Get existing conversation
+        # Verify conversation exists and belongs to user
         conversation = db.exec(
-            select(Conversation).where(Conversation.id == conversation_id).where(Conversation.user_id == current_user_id)
+            select(Conversation)
+            .where(Conversation.id == conversation_id)
+            .where(Conversation.user_id == user_id_int)
         ).first()
         if not conversation:
             raise HTTPException(
@@ -276,41 +308,85 @@ def chat_with_assistant(
                 detail="Conversation not found"
             )
 
-    # Save user message to the conversation
+    # Process via OpenAI Agent (stateless - agent loads history from DB)
+    try:
+        result = await run_agent_for_chat(
+            user_id=user_id_int,
+            user_message=user_message,
+            conversation_id=conversation_id,
+            db=db
+        )
+
+        return ChatResponse(
+            response=result["response"],
+            conversation_id=result["conversation_id"]
+        )
+    except Exception as e:
+        # Fallback to simple processing if agent fails
+        response_text = process_user_message_fallback(user_message, current_user_id, db)
+
+        # Save messages to DB
+        save_chat_messages(db, conversation_id, user_message, response_text)
+
+        return ChatResponse(
+            response=response_text,
+            conversation_id=conversation_id
+        )
+
+
+async def run_agent_for_chat(
+    user_id: int,
+    user_message: str,
+    conversation_id: int,
+    db: Session
+) -> Dict[str, Any]:
+    """
+    Run the OpenAI Agent for chat processing.
+
+    This function is stateless - it loads conversation history from DB,
+    runs the agent, and saves the result back to DB.
+    """
+    # Import agent components (lazy import to avoid circular deps)
+    from agent import TodoAgentRunner
+
+    # Create runner (stateless - no server state held)
+    runner = TodoAgentRunner(user_id=user_id)
+
+    # Run the agent asynchronously
+    result = await runner.run(user_message, conversation_id)
+
+    return result
+
+
+def save_chat_messages(db: Session, conversation_id: int, user_message: str, assistant_response: str):
+    """Save user and assistant messages to the database."""
+    # Save user message
     user_msg = Message(
         conversation_id=conversation_id,
         role=MessageRole.user,
         content=user_message
     )
     db.add(user_msg)
-    db.commit()
 
-    # Process the user's message and generate a response
-    # This is a simplified version - in a real app, you'd integrate with OpenAI or another AI service
-    response_text = process_user_message(user_message, current_user_id, db)
-
-    # Save assistant message to the conversation
+    # Save assistant message
     assistant_msg = Message(
         conversation_id=conversation_id,
         role=MessageRole.assistant,
-        content=response_text
+        content=assistant_response
     )
     db.add(assistant_msg)
     db.commit()
 
-    return {
-        "response": response_text,
-        "conversation_id": conversation_id
-    }
 
-
-def process_user_message(message: str, user_id: str, db: Session) -> str:
-    """Process the user message and generate an appropriate response."""
+def process_user_message_fallback(message: str, user_id: str, db: Session) -> str:
+    """
+    Fallback message processor when OpenAI Agent is unavailable.
+    Uses simple pattern matching for basic task operations.
+    """
     message_lower = message.lower()
 
     # Handle task-related commands
     if "add task" in message_lower or "create task" in message_lower:
-        # Extract task title from the message
         task_title = message_lower.replace("add task", "").replace("create task", "").strip()
         if not task_title:
             return "Please specify what task you'd like to add. For example: 'Add task Buy groceries'"
@@ -326,51 +402,39 @@ def process_user_message(message: str, user_id: str, db: Session) -> str:
 
         task_list = []
         for task in tasks:
-            status_emoji = "✅" if task.status == "completed" else "⏳"
+            status_emoji = "✅" if task.status.value == "completed" else "⏳"
             task_list.append(f"{status_emoji} {task.id}. {task.title}")
 
-        return f"Here are your tasks:\n" + "\n".join(task_list)
+        return "Here are your tasks:\n" + "\n".join(task_list)
 
     elif "complete task" in message_lower or "finish task" in message_lower:
-        # Extract task ID from the message
         import re
         task_id_match = re.search(r'\d+', message)
         if task_id_match:
             task_id = int(task_id_match.group())
-            # Get the task by ID and user
             task = get_task_by_id(db, task_id, user_id)
             if task:
-                # Update the task status to completed
                 task_update = TaskUpdate(status="completed")
                 updated_task = update_task(db, task_id, user_id, task_update)
                 if updated_task:
                     return f"Task '{updated_task.title}' has been marked as completed!"
-                else:
-                    return f"Failed to update task {task_id}."
-            else:
-                return f"Task {task_id} not found or you don't have permission to access it."
-        else:
-            return "Please specify which task to complete. For example: 'Complete task 1'"
+                return f"Failed to update task {task_id}."
+            return f"Task {task_id} not found or you don't have permission to access it."
+        return "Please specify which task to complete. For example: 'Complete task 1'"
 
     elif "delete task" in message_lower or "remove task" in message_lower:
-        # Extract task ID from the message
         import re
         task_id_match = re.search(r'\d+', message)
         if task_id_match:
             task_id = int(task_id_match.group())
-            # Get the task first to show its name
             task = get_task_by_id(db, task_id, user_id)
             if task:
-                # Delete the task
                 success = delete_task(db, task_id, user_id)
                 if success:
                     return f"Task '{task.title}' has been deleted successfully!"
-                else:
-                    return f"Failed to delete task {task_id}."
-            else:
-                return f"Task {task_id} not found or you don't have permission to access it."
-        else:
-            return "Please specify which task to delete. For example: 'Delete task 1'"
+                return f"Failed to delete task {task_id}."
+            return f"Task {task_id} not found or you don't have permission to access it."
+        return "Please specify which task to delete. For example: 'Delete task 1'"
 
     elif "help" in message_lower:
         return ("I can help you manage your tasks! Try commands like:\n"
@@ -381,7 +445,6 @@ def process_user_message(message: str, user_id: str, db: Session) -> str:
                 "- 'Delete task [id]' to remove a task")
 
     else:
-        # Default response for non-task related messages
         return f"I received your message: '{message}'. I can help you manage your tasks. Type 'help' to see what I can do!"
 
 

@@ -15,6 +15,7 @@ class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(unique=True, index=True)
     name: str
+    password: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -58,3 +59,23 @@ class Message(SQLModel, table=True):
 
     # Relationship to conversation
     conversation: Conversation = Relationship()
+
+# Pydantic models for API
+class TaskCreate(SQLModel):
+    title: str
+    description: Optional[str] = None
+    status: TaskStatus = TaskStatus.pending
+
+class TaskUpdate(SQLModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[TaskStatus] = None
+
+class TaskRead(SQLModel):
+    id: int
+    title: str
+    description: Optional[str] = None
+    status: TaskStatus
+    user_id: int
+    created_at: datetime
+    updated_at: datetime

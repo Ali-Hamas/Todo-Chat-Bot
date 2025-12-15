@@ -1,6 +1,6 @@
 from sqlmodel import Session, select
 from typing import List, Optional
-from models import Task, TaskCreate, TaskUpdate, TaskRead, TaskStatus, Message, MessageRole
+from models.todo_models import Task, TaskCreate, TaskUpdate, TaskRead, TaskStatus, Message, MessageRole
 from datetime import datetime
 
 def get_user_tasks(db: Session, user_id: str, status_filter: str = "all") -> List[TaskRead]:

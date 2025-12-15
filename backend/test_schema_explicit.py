@@ -3,16 +3,7 @@ from sqlalchemy import Column, Integer
 from typing import Optional
 from datetime import datetime
 
-# Define a simple User model with explicit autoincrement
-class User(SQLModel, table=True):
-    __tablename__ = "users"
-
-    id: Optional[int] = Field(default=None, sa_column=Column(Integer, primary_key=True, autoincrement=True))
-    email: str = Field(unique=True, index=True)
-    name: str
-    password: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+from backend.models.todo_models import User
 
 # Create engine
 engine = create_engine("sqlite:///./test_explicit_todo.db", echo=True)

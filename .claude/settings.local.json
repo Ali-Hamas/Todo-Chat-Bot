@@ -77,7 +77,8 @@
       "Bash(dir backend /s)",
       "Bash(findstr \".db\")",
       "Bash(ls backend/*.db)",
-      "Bash(python -m uvicorn main:app --reload)"
+      "Bash(python -m uvicorn main:app --reload)",
+      "Bash(mkdir:*)"
     ]
   }
 }

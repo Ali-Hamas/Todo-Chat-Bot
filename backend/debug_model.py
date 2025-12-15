@@ -1,4 +1,4 @@
-from models import User
+from backend.models.todo_models import User
 from sqlmodel import SQLModel
 # Compatibility for older pydantic/sqlmodel versions
 try:
