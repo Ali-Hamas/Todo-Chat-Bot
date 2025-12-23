@@ -34,19 +34,21 @@ class Task(SQLModel, table=True):
     # Relationship to user
     user: User = Relationship()
 
-# Conversation model (from specs)
+# Conversation model (from specs/database/schema_update.md)
 class Conversation(SQLModel, table=True):
     __tablename__ = "conversations"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(foreign_key="users.id")
+    user_id: int = Field(foreign_key="users.id", index=True)
+    title: Optional[str] = Field(default="New Conversation")
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-# Message model (from specs)
+# Message model (from specs/database/schema_update.md)
 class MessageRole(str, enum.Enum):
     user = "user"
     assistant = "assistant"
+    system = "system"
+    tool = "tool"
 
 class Message(SQLModel, table=True):
     __tablename__ = "messages"
@@ -54,7 +56,7 @@ class Message(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     conversation_id: int = Field(foreign_key="conversations.id")
     role: MessageRole
-    content: str
+    content: str  # text field
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     # Relationship to conversation

@@ -78,7 +78,9 @@
       "Bash(findstr \".db\")",
       "Bash(ls backend/*.db)",
       "Bash(python -m uvicorn main:app --reload)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(python:*)",
+      "Bash(sqlite3:*)"
     ]
   }
 }
