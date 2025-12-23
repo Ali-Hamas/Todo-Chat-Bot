@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import contextmanager
-from mcp import Server
+from mcp.server import Server
 from backend.app.skills.todo_skill import TodoManagementSkill
 from backend.database.connection import Session, engine
 

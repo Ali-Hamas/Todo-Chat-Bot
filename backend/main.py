@@ -268,13 +268,18 @@ async def chat_with_assistant(
     db: Session = Depends(get_session)
 ):
     """
-    Stateless chat endpoint that processes messages via OpenAI Agent.
+    AI Agent Chat Endpoint (specs/features/ai_agent.md)
 
-    Per spec: Receives a message, processes it via OpenAI Agent,
-    executes MCP tools, saves state to DB, and returns response.
+    Implements the complete Request Flow:
+    1. Authenticate: User validated via Better Auth (JWT)
+    2. Retrieve Context: Loads last 10 messages from DB
+    3. System Prompt: Sets AI behavior for tool usage
+    4. AI Decision: Sends message + tools to OpenAI
+    5. Tool Execution: Executes MCP tools from mcp_server.py
+    6. Persist: Saves messages to database
 
-    The endpoint is stateless - all conversation history is persisted
-    to Neon DB and loaded fresh for each request.
+    NO string matching - uses OpenAI Tool Calling exclusively.
+    Stateless - all history loaded from database per request.
     """
     user_message = chat_request.message
     conversation_id = chat_request.conversation_id
@@ -308,30 +313,18 @@ async def chat_with_assistant(
                 detail="Conversation not found"
             )
 
-    # Process via OpenAI Agent (stateless - agent loads history from DB)
-    try:
-        result = await run_agent_for_chat(
-            user_id=user_id_int,
-            user_message=user_message,
-            conversation_id=conversation_id,
-            db=db
-        )
+    # Process via OpenAI with Tool Calling (follows specs/features/ai_agent.md)
+    result = await run_agent_for_chat(
+        user_id=user_id_int,
+        user_message=user_message,
+        conversation_id=conversation_id,
+        db=db
+    )
 
-        return ChatResponse(
-            response=result["response"],
-            conversation_id=result["conversation_id"]
-        )
-    except Exception as e:
-        # Fallback to simple processing if agent fails
-        response_text = process_user_message_fallback(user_message, current_user_id, db)
-
-        # Save messages to DB
-        save_chat_messages(db, conversation_id, user_message, response_text)
-
-        return ChatResponse(
-            response=response_text,
-            conversation_id=conversation_id
-        )
+    return ChatResponse(
+        response=result["response"],
+        conversation_id=result["conversation_id"]
+    )
 
 
 async def run_agent_for_chat(
@@ -341,21 +334,101 @@ async def run_agent_for_chat(
     db: Session
 ) -> Dict[str, Any]:
     """
-    Run the OpenAI Agent for chat processing.
+    Implements the Request Flow from specs/features/ai_agent.md
 
-    This function is stateless - it loads conversation history from DB,
-    runs the agent, and saves the result back to DB.
+    Steps (from ai_agent.md):
+    1. Authenticate: User validated via Better Auth (handled by endpoint)
+    2. Retrieve Context: Fetch last 10 messages from Message table
+    3. System Prompt: Set the AI's behavior and tool usage instructions
+    4. AI Decision: Send Message + History + Tools to OpenAI
+    5. Tool Execution: Execute tool_calls and feed results back to OpenAI
+    6. Persist: Save User and Assistant messages to DB
+
+    NO string matching - relies entirely on OpenAI Tool Calling.
     """
-    # Import agent components (lazy import to avoid circular deps)
-    from agent import TodoAgentRunner
+    import os
+    from openai import OpenAI
+    from mcp_server import get_tool_definitions, execute_tool
 
-    # Create runner (stateless - no server state held)
-    runner = TodoAgentRunner(user_id=user_id)
+    # Initialize OpenAI client
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    # Run the agent asynchronously
-    result = await runner.run(user_message, conversation_id)
+    # STEP 2: Retrieve Context - Fetch last 10 messages from Message table
+    messages_query = (
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.desc())
+        .limit(10)
+    )
+    history_messages = db.exec(messages_query).all()
+    history_messages = list(reversed(history_messages))  # Chronological order
 
-    return result
+    # STEP 3: System Prompt (exact text from specs/features/ai_agent.md)
+    system_prompt = """You are a helpful Todo Assistant. You act on behalf of the user. If the user wants to add, view, or modify tasks, you MUST call the provided tools. Do not ask for confirmation unless necessary."""
+
+    # Build messages: System Prompt + Chat History + New User Message
+    messages = [{"role": "system", "content": system_prompt}]
+
+    for msg in history_messages:
+        messages.append({
+            "role": msg.role.value,
+            "content": msg.content
+        })
+
+    messages.append({"role": "user", "content": user_message})
+
+    # STEP 4: AI Decision - Send User Message + History + Tools to OpenAI
+    tools = get_tool_definitions()
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        tools=tools,
+        tool_choice="auto"
+    )
+
+    response_message = response.choices[0].message
+
+    # STEP 5: Tool Execution
+    # CRITICAL: If OpenAI returns tool_call, execute Python function immediately
+    if response_message.tool_calls:
+        messages.append(response_message)
+
+        # Execute each tool call
+        for tool_call in response_message.tool_calls:
+            function_name = tool_call.function.name
+            import json
+            function_args = json.loads(tool_call.function.arguments)
+
+            # Execute the tool from mcp_server.py
+            tool_result = execute_tool(function_name, function_args, user_id)
+
+            # Send result back to OpenAI
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": function_name,
+                "content": tool_result
+            })
+
+        # Generate final natural language response
+        final_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages
+        )
+
+        assistant_response = final_response.choices[0].message.content
+    else:
+        # No tool calls - direct response
+        assistant_response = response_message.content
+
+    # STEP 6: Persist - Save User message and final Assistant response to DB
+    save_chat_messages(db, conversation_id, user_message, assistant_response)
+
+    return {
+        "response": assistant_response,
+        "conversation_id": conversation_id
+    }
 
 
 def save_chat_messages(db: Session, conversation_id: int, user_message: str, assistant_response: str):
@@ -376,76 +449,6 @@ def save_chat_messages(db: Session, conversation_id: int, user_message: str, ass
     )
     db.add(assistant_msg)
     db.commit()
-
-
-def process_user_message_fallback(message: str, user_id: str, db: Session) -> str:
-    """
-    Fallback message processor when OpenAI Agent is unavailable.
-    Uses simple pattern matching for basic task operations.
-    """
-    message_lower = message.lower()
-
-    # Handle task-related commands
-    if "add task" in message_lower or "create task" in message_lower:
-        task_title = message_lower.replace("add task", "").replace("create task", "").strip()
-        if not task_title:
-            return "Please specify what task you'd like to add. For example: 'Add task Buy groceries'"
-
-        task_data = TaskCreate(title=task_title, description="Added via chat")
-        task = create_task_for_user(db, task_data, user_id)
-        return f"Task '{task.title}' has been added successfully!"
-
-    elif "list task" in message_lower or "show task" in message_lower or "my task" in message_lower:
-        tasks = get_user_tasks(db, user_id, "all")
-        if not tasks:
-            return "You don't have any tasks yet. Try adding one!"
-
-        task_list = []
-        for task in tasks:
-            status_emoji = "✅" if task.status.value == "completed" else "⏳"
-            task_list.append(f"{status_emoji} {task.id}. {task.title}")
-
-        return "Here are your tasks:\n" + "\n".join(task_list)
-
-    elif "complete task" in message_lower or "finish task" in message_lower:
-        import re
-        task_id_match = re.search(r'\d+', message)
-        if task_id_match:
-            task_id = int(task_id_match.group())
-            task = get_task_by_id(db, task_id, user_id)
-            if task:
-                task_update = TaskUpdate(status="completed")
-                updated_task = update_task(db, task_id, user_id, task_update)
-                if updated_task:
-                    return f"Task '{updated_task.title}' has been marked as completed!"
-                return f"Failed to update task {task_id}."
-            return f"Task {task_id} not found or you don't have permission to access it."
-        return "Please specify which task to complete. For example: 'Complete task 1'"
-
-    elif "delete task" in message_lower or "remove task" in message_lower:
-        import re
-        task_id_match = re.search(r'\d+', message)
-        if task_id_match:
-            task_id = int(task_id_match.group())
-            task = get_task_by_id(db, task_id, user_id)
-            if task:
-                success = delete_task(db, task_id, user_id)
-                if success:
-                    return f"Task '{task.title}' has been deleted successfully!"
-                return f"Failed to delete task {task_id}."
-            return f"Task {task_id} not found or you don't have permission to access it."
-        return "Please specify which task to delete. For example: 'Delete task 1'"
-
-    elif "help" in message_lower:
-        return ("I can help you manage your tasks! Try commands like:\n"
-                "- 'Add task [task name]' to create a new task\n"
-                "- 'List tasks' to see your tasks\n"
-                "- 'Show my tasks' to see your tasks\n"
-                "- 'Complete task [id]' to mark a task as completed\n"
-                "- 'Delete task [id]' to remove a task")
-
-    else:
-        return f"I received your message: '{message}'. I can help you manage your tasks. Type 'help' to see what I can do!"
 
 
 # For running with uvicorn
